@@ -5,7 +5,7 @@ from collections.abc import Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from typing_extensions import TypeVar
 
@@ -878,3 +878,193 @@ class SameOperandsAndResultType(OpTrait):
                 raise VerifyException(
                     f"'{op.name} requires the same encoding for all operands and results"
                 )
+
+
+@dataclass(frozen=True)
+class RegionSuccessor:
+    """
+    This class represents a successor of a region. A region successor can either target another
+    region or target an ancestor operation (at the moment, limited to the immediate parent
+    operation). In the latter case, the control flow branches after/out of the target operation."""
+
+    successor: Region | Operation
+
+    @property
+    def region(self) -> Region | None:
+        """
+        The successor region. None if the successor is an operation.
+
+        Implements MLIR `RegionSuccessor::getSuccessor`.
+        """
+        from xdsl.ir import Region
+
+        return self.successor if isinstance(self.successor, Region) else None
+
+    @property
+    def operation(self) -> Operation | None:
+        """
+        The successor operation. None if the successor is a region.
+
+        Implements MLIR `RegionSuccessor::getSuccessorOp`.
+        """
+        from xdsl.ir import Operation
+
+        return self.successor if isinstance(self.successor, Operation) else None
+
+    def is_region(self) -> bool:
+        """
+        Return true if the successor is a region.
+
+        Implements MLIR `RegionSuccessor::isRegion`.
+        """
+        from xdsl.ir import Region
+
+        return isinstance(self.successor, Region)
+
+    def is_operation(self) -> bool:
+        """
+        Return true if the successor is an operation.
+
+        Implements MLIR `RegionSuccessor::isOperation`.
+        """
+        from xdsl.ir import Operation
+
+        return isinstance(self.successor, Operation)
+
+
+@dataclass(frozen=True, init=False)
+class RegionBranchPoint:
+    """
+    This class represents a point being branched from in the methods of the
+    `RegionBranchOpInterface`.
+
+    One can branch from one of two kinds of places:
+    * The parent operation (aka the `RegionBranchOpInterface` implementation)
+    * A `RegionBranchTerminatorOpInterface` inside a region within the parent operation.
+
+    Construct with the terminator being branched from. Use `RegionBranchPoint.PARENT` to branch
+    from the parent operation. Raises `ValueError` if the terminator does not implement
+    `RegionBranchTerminatorOpInterface`. The constructor implements MLIR
+    `RegionBranchPoint(RegionBranchTerminatorOpInterface)`.
+    """
+
+    predecessor: Operation | None
+
+    _interface: RegionBranchTerminatorOpTrait | None = field(compare=False, repr=False)
+    """The `RegionBranchTerminatorOpTrait` of `predecessor`."""
+
+    PARENT: ClassVar[RegionBranchPoint]
+    """
+    The `RegionBranchPoint` representing the parent operation.
+
+    Implements MLIR `RegionBranchPoint::parent`.
+    """
+
+    def __init__(self, predecessor: Operation) -> None:
+        interface = predecessor.get_trait(RegionBranchTerminatorOpTrait)
+        if interface is None:
+            raise ValueError(
+                f"'{predecessor.name}' does not implement RegionBranchTerminatorOpInterface."
+            )
+        object.__setattr__(self, "predecessor", predecessor)
+        object.__setattr__(self, "_interface", interface)
+
+    def is_parent(self) -> bool:
+        """
+        Returns true if branching from the parent op.
+
+        Implements MLIR `RegionBranchPoint::isParent`.
+        """
+        return self.predecessor is None
+
+    @property
+    def terminator(self) -> Operation | None:
+        """
+        The terminator if branching from a region. None otherwise.
+
+        Implements MLIR `RegionBranchPoint::getTerminatorPredecessorOrNull`.
+        """
+        return self.predecessor
+
+    @property
+    def terminator_and_interface(
+        self,
+    ) -> tuple[Operation, RegionBranchTerminatorOpTrait] | None:
+        """
+        The terminator and its `RegionBranchTerminatorOpTrait` if branching from a
+        region. None otherwise.
+
+        Implements MLIR `RegionBranchPoint::getTerminatorPredecessorOrNull`, together with
+        `terminator`. MLIR returns a single interface handle that is both the op and its interface
+        methods. In xDSL the op and its trait are separate objects, and the trait methods take the
+        op as an argument, so this property returns both.
+        """
+        if self.predecessor is None or self._interface is None:
+            return None
+        return self.predecessor, self._interface
+
+
+# Mirrors MLIR's private default constructor: bypasses `__init__`, which rejects `None`.
+RegionBranchPoint.PARENT = object.__new__(RegionBranchPoint)
+object.__setattr__(RegionBranchPoint.PARENT, "predecessor", None)
+object.__setattr__(RegionBranchPoint.PARENT, "_interface", None)
+
+
+@dataclass(frozen=True)
+class InvocationBounds:
+    """
+    This class represents upper and lower bounds on the number of times a region of a
+    `RegionBranchOpInterface` can be invoked. The lower bound is at least zero, but the upper bound
+    may not be known.
+    """
+
+    lower: int
+    """
+    The minimum number of times the successor region will be invoked.
+
+    Implements MLIR `InvocationBounds::getLowerBound`.
+    """
+
+    upper: int | None
+    """
+    The maximum number of times the successor region will be invoked or `None` if an upper bound
+    is not known.
+
+    Implements MLIR `InvocationBounds::getUpperBound`.
+    """
+
+    UNKNOWN: ClassVar[InvocationBounds]
+    """
+    The unknown invocation bounds, i.e., there is no information on how many times a region may
+    be invoked.
+
+    Implements MLIR `InvocationBounds::getUnknown`.
+    """
+
+    def __post_init__(self) -> None:
+        """Implements the checks of MLIR `InvocationBounds` constructor."""
+        if self.lower < 0:
+            raise ValueError(
+                f"Invocation lower bound must be at least 0, got {self.lower}."
+            )
+        if self.upper is not None and self.upper < self.lower:
+            raise ValueError(
+                f"Invocation upper bound ({self.upper}) cannot be less than lower bound "
+                f"({self.lower})."
+            )
+
+
+InvocationBounds.UNKNOWN = InvocationBounds(0, None)
+
+
+class RegionBranchTerminatorOpTrait(OpTrait):
+    """
+    This interface provides information for branching terminator operations in the presence of a
+    parent `RegionBranchOpInterface` implementation. It acts as a marker for valid region branch
+    points and specifies which operands are passed to which region successor.
+
+    Note: If an operation does not implement the `RegionBranchTerminatorOpInterface`, then that op
+    has no region successors. (However, there may be other block terminators in the same region
+    that implement the `RegionBranchTerminatorOpInterface`, so the enclosing region may have region
+    successors.)
+    """

@@ -56,10 +56,14 @@ from xdsl.traits import (
     ConditionallySpeculatable,
     HasAncestor,
     HasParent,
+    InvocationBounds,
     IsTerminator,
     MemoryEffectKind,
     OptionalSymbolOpInterface,
     RecursivelySpeculatable,
+    RegionBranchPoint,
+    RegionBranchTerminatorOpTrait,
+    RegionSuccessor,
     ReturnLike,
     SameOperandsAndResultType,
     SymbolOpInterface,
@@ -1093,3 +1097,63 @@ def test_return_like():
         match=re.escape("test.return_like does not have zero successors"),
     ):
         successors.verify()
+
+
+@irdl_op_definition
+class TerminatorOp(IRDLOperation):
+    """
+    A terminator implementing `RegionBranchTerminatorOpTrait` directly, without
+    `RegionBranchTerminatorOpInterface`.
+    """
+
+    name = "test.terminator"
+    args = var_operand_def()
+    traits = traits_def(IsTerminator(), RegionBranchTerminatorOpTrait())
+
+
+def test_region_successor():
+    op = test.TestOp()
+    region = Region()
+    assert RegionSuccessor(region).region is region
+    assert RegionSuccessor(region).operation is None
+    assert RegionSuccessor(region).is_region()
+    assert RegionSuccessor(op).operation is op
+    assert RegionSuccessor(op).region is None
+    assert RegionSuccessor(op).is_operation()
+    assert RegionSuccessor(region) == RegionSuccessor(region)
+    assert (
+        len({RegionSuccessor(region), RegionSuccessor(region), RegionSuccessor(op)})
+        == 2
+    )
+
+
+def test_region_branch_point():
+    terminator = TerminatorOp(operands=[[]])
+    point = RegionBranchPoint(terminator)
+    assert RegionBranchPoint.PARENT.is_parent()
+    assert RegionBranchPoint.PARENT.terminator is None
+    assert RegionBranchPoint.PARENT.terminator_and_interface is None
+    assert not point.is_parent()
+    assert point.terminator is terminator
+    assert point.terminator_and_interface == (
+        terminator,
+        terminator.get_trait(RegionBranchTerminatorOpTrait),
+    )
+    assert point == RegionBranchPoint(terminator)
+    assert point != RegionBranchPoint.PARENT
+    assert len({point, RegionBranchPoint(terminator), RegionBranchPoint.PARENT}) == 2
+
+
+def test_region_branch_point_without_terminator_interface():
+    message = "'test.op' does not implement RegionBranchTerminatorOpInterface."
+    with pytest.raises(ValueError, match=re.escape(message)):
+        RegionBranchPoint(test.TestOp())
+
+
+def test_invocation_bounds():
+    assert InvocationBounds(0, None) == InvocationBounds.UNKNOWN
+    assert InvocationBounds(2, 2).upper == 2
+    with pytest.raises(ValueError, match="lower bound must be at least 0"):
+        InvocationBounds(-1, None)
+    with pytest.raises(ValueError, match="cannot be less than lower bound"):
+        InvocationBounds(2, 1)
